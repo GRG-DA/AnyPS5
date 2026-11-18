@@ -9,6 +9,8 @@ namespace Codegen {
 enum class BitfieldOperation : std::uint8_t {
     ZeroHigh,
     Extract,
+    Deposit,
+    Gather,
 };
 
 struct BitfieldOperands {

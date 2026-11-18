@@ -17,6 +17,10 @@ constexpr std::uint8_t kJumpBelow = 0x72;
 constexpr std::uint8_t kJumpAboveOrEqual = 0x73;
 constexpr std::uint8_t kJump = 0xEB;
 constexpr std::uint8_t kSetCarry = 0xF9;
+constexpr std::int32_t kLoopMaskSlot = 16;
+constexpr std::int32_t kLoopSourceSlot = 8;
+constexpr std::int32_t kLoopTempSlot = 24;
+constexpr std::int32_t kLoopSpillBytes = 32;
 
 std::uint8_t _bits(const BitfieldOperands& operands) {
     return operands.Wide ? 64 : 32;
@@ -78,12 +82,95 @@ void _extract(StubBodyBuilder& body, const BitfieldOperands& operands, const std
     Register(body, 0x21, operands.Wide, mask, result);
 }
 
+void _saveScratch(StubBodyBuilder& body, const std::uint8_t reg, const std::int32_t slot) {
+    StackSlot(body, 0x89, true, reg, slot);
+}
+
+void _restoreScratch(StubBodyBuilder& body, const std::uint8_t reg, const std::int32_t slot) {
+    StackSlot(body, 0x8B, true, reg, slot);
+}
+
+void _depositGather(StubBodyBuilder& body, const BitfieldOperands& operands, const char* name) {
+    auto used = operands.Memory ? UsedRegisters({operands.Destination, operands.Source, operands.Control}, operands.Memory)
+                                : UsedRegisters({operands.Destination, operands.Source, operands.Control}, std::nullopt);
+    const auto result = Scratch(used, name);
+    const auto mask = Scratch(used, name);
+    const auto source = Scratch(used, name);
+    const auto temp = Scratch(used, name);
+    const auto frame = SelectFrame(operands.Memory, operands.Wide, kFrame, kLoopSpillBytes);
+    StackSlot(body, 0x8D, true, Stack, -frame);
+    _saveScratch(body, result, kResultSlot);
+    _saveScratch(body, mask, kLoopMaskSlot);
+    _saveScratch(body, source, kLoopSourceSlot);
+    _saveScratch(body, temp, kLoopTempSlot);
+    if (operands.Memory)
+        Memory(body, 0x8B, operands.Wide, *operands.Memory, mask, name, frame);
+    else if (operands.Source == Stack)
+        StackSlot(body, 0x8D, true, mask, frame);
+    else
+        Register(body, 0x8B, operands.Wide, mask, operands.Source);
+    if (operands.Control == Stack)
+        StackSlot(body, 0x8D, true, source, frame);
+    else
+        Register(body, 0x8B, operands.Wide, source, operands.Control);
+    Register(body, 0x31, operands.Wide, result, result);
+    const auto twoByte = [](const std::uint8_t opcode, const std::uint8_t reg, const std::uint8_t rm) {
+        return std::vector<std::uint8_t>{Rex(true, reg, rm), 0x0F, opcode, static_cast<std::uint8_t>(0xC0 | ((reg & 7) << 3) | (rm & 7))};
+    };
+    std::vector<std::uint8_t> loop;
+    if (operands.Operation == BitfieldOperation::Gather) {
+        _append(loop, twoByte(0xBD, temp, mask));
+        _append(loop, twoByte(0xA3, temp, source));
+        _append(loop, RegisterBytes(0x11, true, result, result));
+        _append(loop, twoByte(0xB3, temp, mask));
+    } else {
+        _append(loop, RegisterBytes(0x8B, true, temp, mask));
+        _append(loop, RegisterBytes(0xF7, true, 3, temp));
+        _append(loop, RegisterBytes(0x21, true, mask, temp));
+        auto tested = RegisterBytes(0xF7, true, 0, source);
+        Append32(tested, 1);
+        _append(loop, tested);
+        const auto skipOffset = loop.size();
+        loop.push_back(0x74);
+        loop.push_back(0);
+        const auto deposit = RegisterBytes(0x09, true, temp, result);
+        _append(loop, deposit);
+        loop[skipOffset + 1] = static_cast<std::uint8_t>(deposit.size());
+        _append(loop, RegisterBytes(0xD1, true, 5, source));
+        _append(loop, RegisterBytes(0x31, true, temp, mask));
+    }
+    _append(loop, RegisterBytes(0x85, true, mask, mask));
+    loop.push_back(0x75);
+    const auto back = static_cast<std::int32_t>(loop.size()) + 1;
+    if (back > 128) throw CodegenException(std::string(name) + " loop exceeds a short jump");
+    loop.push_back(static_cast<std::uint8_t>(-back));
+    if (loop.size() > 127) throw CodegenException(std::string(name) + " loop body exceeds a short jump");
+    body.Raw(RegisterBytes(0x85, true, mask, mask));
+    body.Raw(std::array{static_cast<std::uint8_t>(0x74), static_cast<std::uint8_t>(loop.size())});
+    body.Raw(loop);
+    body.Raw(RegisterBytes(0x85, true, result, result));
+    if (operands.Destination != Stack)
+        Register(body, 0x8B, operands.Wide, operands.Destination, result);
+    _restoreScratch(body, temp, kLoopTempSlot);
+    if (operands.Destination == Stack)
+        StackSlot(body, 0x89, true, result, kLoopTempSlot);
+    _restoreScratch(body, source, kLoopSourceSlot);
+    _restoreScratch(body, mask, kLoopMaskSlot);
+    _restoreScratch(body, result, kResultSlot);
+    if (operands.Destination == Stack)
+        StackSlot(body, 0x8B, true, Stack, kLoopTempSlot);
+    else
+        StackSlot(body, 0x8D, true, Stack, frame);
+}
+
 }
 
 const char* BitfieldName(const BitfieldOperation operation) {
     switch (operation) {
     case BitfieldOperation::ZeroHigh: return "BZHI";
     case BitfieldOperation::Extract: return "BEXTR";
+    case BitfieldOperation::Deposit: return "PDEP";
+    case BitfieldOperation::Gather: return "PEXT";
     }
     throw CodegenException("unknown bitfield operation");
 }
@@ -91,14 +178,23 @@ const char* BitfieldName(const BitfieldOperation operation) {
 std::optional<BitfieldOperands> DecodeBitfield(const std::uint8_t* data, const std::size_t length) {
     std::size_t vex = 0;
     while (vex < length && LegacyPrefix(data[vex])) ++vex;
-    if (vex + 5 > length || data[vex] != 0xC4 || (data[vex + 1] & 0x1F) != 2 || (data[vex + 2] & 3) != 0) return std::nullopt;
+    if (vex + 5 > length || data[vex] != 0xC4 || (data[vex + 1] & 0x1F) != 2) return std::nullopt;
     BitfieldOperation operation;
-    if (data[vex + 3] == 0xF5)
-        operation = BitfieldOperation::ZeroHigh;
-    else if (data[vex + 3] == 0xF7)
+    const auto prefix = static_cast<std::uint8_t>(data[vex + 2] & 3);
+    if (data[vex + 3] == 0xF5) {
+        if (prefix == 0)
+            operation = BitfieldOperation::ZeroHigh;
+        else if (prefix == 2)
+            operation = BitfieldOperation::Deposit;
+        else if (prefix == 3)
+            operation = BitfieldOperation::Gather;
+        else
+            return std::nullopt;
+    } else if (data[vex + 3] == 0xF7 && prefix == 0) {
         operation = BitfieldOperation::Extract;
-    else
+    } else {
         return std::nullopt;
+    }
     const auto name = BitfieldName(operation);
     if ((data[vex + 2] & 4) != 0) throw CodegenException(std::string(name) + " requires VEX.L=0");
     const auto extensions = static_cast<std::uint8_t>(~data[vex + 1]);
@@ -121,6 +217,10 @@ std::optional<BitfieldOperands> DecodeBitfield(const std::uint8_t* data, const s
 
 void EmitBitfield(StubBodyBuilder& body, const BitfieldOperands& operands) {
     const auto name = BitfieldName(operands.Operation);
+    if (operands.Operation == BitfieldOperation::Deposit || operands.Operation == BitfieldOperation::Gather) {
+        _depositGather(body, operands, name);
+        return;
+    }
     auto used = operands.Memory ? UsedRegisters({operands.Destination, operands.Control, kControlRegister}, operands.Memory)
                                 : UsedRegisters({operands.Destination, operands.Source, operands.Control, kControlRegister}, std::nullopt);
     const auto result = Scratch(used, name);

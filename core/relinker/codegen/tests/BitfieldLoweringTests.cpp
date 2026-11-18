@@ -16,24 +16,30 @@ namespace {
 using LoweringExecution::Bytes;
 using Codegen::BitfieldOperation;
 
-constexpr std::array kOperations{BitfieldOperation::ZeroHigh, BitfieldOperation::Extract};
+constexpr std::array kOperations{BitfieldOperation::ZeroHigh, BitfieldOperation::Extract, BitfieldOperation::Deposit, BitfieldOperation::Gather};
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
 std::uint8_t opcode(BitfieldOperation operation) {
-    return operation == BitfieldOperation::ZeroHigh ? 0xF5 : 0xF7;
+    return operation == BitfieldOperation::Extract ? 0xF7 : 0xF5;
+}
+
+std::uint8_t prefix(BitfieldOperation operation) {
+    if (operation == BitfieldOperation::Deposit) return 2;
+    if (operation == BitfieldOperation::Gather) return 3;
+    return 0;
 }
 
 Bytes instruction(BitfieldOperation operation, bool wide, std::uint8_t dst, std::uint8_t src, std::uint8_t control) {
     return {0xC4, static_cast<std::uint8_t>(0xE2 ^ ((dst & 8) << 4) ^ ((src & 8) << 2)),
-        static_cast<std::uint8_t>((wide ? 0x80 : 0) | ((~control & 15) << 3)), opcode(operation),
+        static_cast<std::uint8_t>((wide ? 0x80 : 0) | prefix(operation) | ((~control & 15) << 3)), opcode(operation),
         static_cast<std::uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7))};
 }
 
 Bytes memorySite(BitfieldOperation operation, bool wide, const Bytes& tail) {
-    Bytes site{0xC4, 0xE2, static_cast<std::uint8_t>((wide ? 0x80 : 0) | 0x40), opcode(operation)};
+    Bytes site{0xC4, 0xE2, static_cast<std::uint8_t>((wide ? 0x80 : 0) | prefix(operation) | 0x40), opcode(operation)};
     site.insert(site.end(), tail.begin(), tail.end());
     return site;
 }
@@ -55,8 +61,8 @@ void decoding() {
     const Bytes memory{0x64, 0x67, 0xC4, 0x02, 0xA8, 0xF5, 0x8C, 0xAC, 0x10, 0, 0, 0};
     const auto operands = Codegen::DecodeBitfield(memory.data(), memory.size());
     require(operands && operands->Operation == BitfieldOperation::ZeroHigh && operands->Destination == 9 && operands->Control == 10 && operands->Memory && operands->Memory->RexIndexBase == 3 && operands->Memory->Prefixes == Bytes{0x64, 0x67}, "bitfield memory extensions or prefixes were lost");
-    for (const Bytes bytes : {Bytes{0x90}, Bytes{0xC4, 0xE2, 0xF0}, Bytes{0xC4, 0xE1, 0xF0, 0xF5, 0xC0}, Bytes{0xC4, 0xE2, 0xF1, 0xF7, 0xC0}, Bytes{0xC4, 0xE2, 0xF3, 0xF5, 0xC0}, Bytes{0xC4, 0xE2, 0xF2, 0xF5, 0xC0}, Bytes{0xC4, 0xE2, 0xF3, 0xF6, 0xC0}, Bytes{0xC4, 0xE2, 0xF0, 0xF3, 0xC8}})
-        require(!Codegen::DecodeBitfield(bytes.data(), bytes.size()), "Unrelated, truncated, SHLX, PDEP, PEXT, MULX or BLSR opcode matched a bitfield instruction");
+    for (const Bytes bytes : {Bytes{0x90}, Bytes{0xC4, 0xE2, 0xF0}, Bytes{0xC4, 0xE1, 0xF0, 0xF5, 0xC0}, Bytes{0xC4, 0xE2, 0xF1, 0xF7, 0xC0}, Bytes{0xC4, 0xE2, 0xF1, 0xF5, 0xC0}, Bytes{0xC4, 0xE2, 0xF2, 0xF7, 0xC0}, Bytes{0xC4, 0xE2, 0xF3, 0xF7, 0xC0}, Bytes{0xC4, 0xE2, 0xF3, 0xF6, 0xC0}, Bytes{0xC4, 0xE2, 0xF0, 0xF3, 0xC8}})
+        require(!Codegen::DecodeBitfield(bytes.data(), bytes.size()), "Unrelated, truncated, SHLX, MULX or BLSR opcode matched a bitfield instruction");
     for (const Bytes bytes : {Bytes{0xC4, 0xE2, 0xF4, 0xF5, 0xC0}, Bytes{0xC4, 0xE2, 0xF0, 0xF7, 0xC0, 0x90}, Bytes{0xC4, 0xE2, 0xF0, 0xF5, 0x84}}) {
         bool rejected = false;
         try { (void)Codegen::DecodeBitfield(bytes.data(), bytes.size()); }
@@ -110,6 +116,22 @@ Expected expected(const Codegen::BitfieldOperands& operands, std::uint64_t sourc
     const auto mask = operands.Wide ? ~std::uint64_t{0} : 0xFFFFFFFFull;
     source &= mask;
     const auto lowBits = [&](unsigned count) { return count >= bits ? mask : (std::uint64_t{1} << count) - 1; };
+    if (operands.Operation == BitfieldOperation::Deposit || operands.Operation == BitfieldOperation::Gather) {
+        const auto value = control & mask;
+        std::uint64_t result = 0;
+        unsigned placed = 0;
+        for (unsigned position = 0; position < bits; ++position) {
+            if (((source >> position) & 1) == 0) continue;
+            if (operands.Operation == BitfieldOperation::Deposit) {
+                if ((value >> placed) & 1) result |= std::uint64_t{1} << position;
+                ++placed;
+            } else {
+                if ((value >> position) & 1) result |= std::uint64_t{1} << placed;
+                ++placed;
+            }
+        }
+        return {result, result == 0 ? LoweringExecution::kZero : 0u, LoweringExecution::kFlagMask & ~LoweringExecution::kSign};
+    }
     if (operands.Operation == BitfieldOperation::ZeroHigh) {
         const auto index = static_cast<unsigned>(control & 0xFF);
         const auto result = index >= bits ? source : source & lowBits(index);
